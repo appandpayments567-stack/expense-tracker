@@ -2,7 +2,7 @@
 Personal Expense Tracker (Streamlit)
 =====================================
 Single-user daily/monthly expense tracker with charts, full CRUD,
-and a formatted Excel export. Default currency: PKR.
+a formatted Excel export, and smart salary-date handling. Currency: PKR.
 
 Storage (automatic):
   - If a Postgres connection string is provided -> Postgres (permanent)
@@ -20,7 +20,7 @@ Run locally:
 
 import os
 from io import BytesIO
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from calendar import monthrange
 
 import pandas as pd
@@ -38,12 +38,10 @@ MISC_CATEGORY = "Miscellaneous"
 ALL_CATEGORIES = DAILY_CATEGORIES + MONTHLY_CATEGORIES + [MISC_CATEGORY]
 
 CURRENCY = "PKR"
+DEFAULT_SALARY_DAY = 25
 
 st.set_page_config(page_title="My Expense Tracker", page_icon="💸", layout="wide")
 
-# ----------------------------------------------------------------------
-# A little styling polish
-# ----------------------------------------------------------------------
 st.markdown(
     """
     <style>
@@ -63,7 +61,7 @@ st.markdown(
 
 
 # ----------------------------------------------------------------------
-# Database
+# Database connection (reused, so the app stays fast)
 # ----------------------------------------------------------------------
 def get_database_url():
     try:
@@ -79,131 +77,115 @@ USE_POSTGRES = bool(DATABASE_URL)
 SQLITE_PATH = "expenses.db"
 
 
-def get_conn():
-    if USE_POSTGRES:
-        import psycopg2
-        return psycopg2.connect(DATABASE_URL, sslmode="require")
-    import sqlite3
-    return sqlite3.connect(SQLITE_PATH)
+@st.cache_resource
+def _pg_conn():
+    """One Postgres connection, reused across reruns. This is the speed fix."""
+    import psycopg2
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+    conn.autocommit = True
+    return conn
 
 
 def q(sql):
     return sql if USE_POSTGRES else sql.replace("%s", "?")
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
+def run(sql, params=(), fetch=False):
+    """Run one statement. Reuses the cached connection on Postgres."""
+    sql = q(sql)
     if USE_POSTGRES:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS expenses (
-                id SERIAL PRIMARY KEY,
-                category TEXT NOT NULL,
-                amount NUMERIC NOT NULL,
-                description TEXT DEFAULT '',
-                spent_on DATE NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        import psycopg2
+        for attempt in range(2):
+            try:
+                conn = _pg_conn()
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                data = cur.fetchall() if fetch else None
+                cur.close()
+                return data
+            except (psycopg2.InterfaceError, psycopg2.OperationalError):
+                # connection went stale (Supabase closed it) -> rebuild once
+                _pg_conn.clear()
+                if attempt == 1:
+                    raise
     else:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS expenses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL,
-                amount REAL NOT NULL,
-                description TEXT DEFAULT '',
-                spent_on TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-    conn.commit()
-    cur.close()
-    conn.close()
+        import sqlite3
+        conn = sqlite3.connect(SQLITE_PATH)
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            data = cur.fetchall() if fetch else None
+            conn.commit()
+            return data
+        finally:
+            conn.close()
 
 
-# ----- settings -----
-def get_setting(key, default=None):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(q("SELECT value FROM settings WHERE key = %s"), (key,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        return row[0] if row else default
-    except Exception:
-        return default
+def init_db():
+    if USE_POSTGRES:
+        run("""CREATE TABLE IF NOT EXISTS expenses (
+                id SERIAL PRIMARY KEY, category TEXT NOT NULL, amount NUMERIC NOT NULL,
+                description TEXT DEFAULT '', spent_on DATE NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW())""")
+    else:
+        run("""CREATE TABLE IF NOT EXISTS expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL, amount REAL NOT NULL,
+                description TEXT DEFAULT '', spent_on TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    run("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+
+
+# run schema check only once per session, not on every rerun
+if "db_ready" not in st.session_state:
+    init_db()
+    st.session_state["db_ready"] = True
+
+
+# ----- settings (loaded in one query per rerun) -----
+def load_settings():
+    rows = run("SELECT key, value FROM settings", fetch=True) or []
+    return {k: v for k, v in rows}
 
 
 def set_setting(key, value):
-    conn = get_conn()
-    cur = conn.cursor()
     if USE_POSTGRES:
-        cur.execute(
-            "INSERT INTO settings (key, value) VALUES (%s, %s) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            (key, str(value)),
-        )
+        run("INSERT INTO settings (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, str(value)))
     else:
-        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-    conn.commit()
-    cur.close()
-    conn.close()
+        run("INSERT OR REPLACE INTO settings (key, value) VALUES (%s, %s)", (key, str(value)))
 
 
 # ----- CRUD -----
 def create_expense(category, amount, description, spent_on):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        q("INSERT INTO expenses (category, amount, description, spent_on) VALUES (%s, %s, %s, %s)"),
-        (category, float(amount), description or "", str(spent_on)),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    run("INSERT INTO expenses (category, amount, description, spent_on) VALUES (%s, %s, %s, %s)",
+        (category, float(amount), description or "", str(spent_on)))
 
 
 def update_expense(expense_id, category, amount, description, spent_on):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        q("UPDATE expenses SET category=%s, amount=%s, description=%s, spent_on=%s WHERE id=%s"),
-        (category, float(amount), description or "", str(spent_on), int(expense_id)),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    run("UPDATE expenses SET category=%s, amount=%s, description=%s, spent_on=%s WHERE id=%s",
+        (category, float(amount), description or "", str(spent_on), int(expense_id)))
 
 
 def delete_expense(expense_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(q("DELETE FROM expenses WHERE id = %s"), (int(expense_id),))
-    conn.commit()
-    cur.close()
-    conn.close()
+    run("DELETE FROM expenses WHERE id = %s", (int(expense_id),))
 
 
 def load_expenses(month=None):
-    conn = get_conn()
-    cur = conn.cursor()
     if month:
-        cur.execute(
-            q("SELECT id, category, amount, description, spent_on FROM expenses "
-              "WHERE CAST(spent_on AS TEXT) LIKE %s ORDER BY spent_on DESC, id DESC"),
-            (month + "%",),
-        )
+        rows = run("SELECT id, category, amount, description, spent_on FROM expenses "
+                   "WHERE CAST(spent_on AS TEXT) LIKE %s ORDER BY spent_on DESC, id DESC",
+                   (month + "%",), fetch=True)
     else:
-        cur.execute(
-            q("SELECT id, category, amount, description, spent_on FROM expenses "
-              "ORDER BY spent_on DESC, id DESC")
-        )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+        rows = run("SELECT id, category, amount, description, spent_on FROM expenses "
+                   "ORDER BY spent_on DESC, id DESC", fetch=True)
+    rows = rows or []
     df = pd.DataFrame(rows, columns=["id", "category", "amount", "description", "spent_on"])
     if not df.empty:
         df["amount"] = df["amount"].astype(float)
@@ -220,6 +202,46 @@ def money(x):
 
 
 # ----------------------------------------------------------------------
+# Salary date logic
+# ----------------------------------------------------------------------
+def estimated_payday(year, month, normal_day):
+    """The normal_day of the month, moved back to Friday if it lands on a weekend."""
+    last = monthrange(year, month)[1]
+    d = date(year, month, min(normal_day, last))
+    wd = d.weekday()  # Mon=0 ... Sat=5, Sun=6
+    if wd == 5:        # Saturday -> Friday
+        d -= timedelta(days=1)
+    elif wd == 6:      # Sunday -> Friday
+        d -= timedelta(days=2)
+    return d
+
+
+def payday_for_month(settings, year, month, normal_day):
+    """Manual override for this month if set, else the weekend-adjusted estimate."""
+    key = f"payday_{year:04d}-{month:02d}"
+    if settings.get(key):
+        try:
+            return date.fromisoformat(settings[key])
+        except Exception:
+            pass
+    return estimated_payday(year, month, normal_day)
+
+
+def next_payday(settings, normal_day, from_date):
+    y, m = from_date.year, from_date.month
+    pd_ = estimated_payday(y, m, normal_day)
+    for _ in range(4):
+        pd_ = payday_for_month(settings, y, m, normal_day)
+        if pd_ >= from_date:
+            return pd_
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return pd_
+
+
+# ----------------------------------------------------------------------
 # Excel export (formatted)
 # ----------------------------------------------------------------------
 def build_excel(df, month_label, salary, budget, total_spent):
@@ -228,25 +250,22 @@ def build_excel(df, month_label, salary, budget, total_spent):
     from openpyxl.utils import get_column_letter
 
     wb = Workbook()
-
     header_fill = PatternFill("solid", fgColor="6C5CE7")
     header_font = Font(bold=True, color="FFFFFF", size=11)
     title_font = Font(bold=True, size=14, color="1A1A2E")
     label_font = Font(bold=True, size=11)
-    money_fmt = '#,##0'
+    money_fmt = "#,##0"
     thin = Side(style="thin", color="D9D9E3")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center")
 
-    # ---- Sheet 1: Expenses ----
     ws = wb.active
     ws.title = "Expenses"
     ws["A1"] = f"Expenses - {month_label}"
     ws["A1"].font = title_font
     ws.merge_cells("A1:D1")
 
-    headers = ["Date", "Category", "Amount (PKR)", "Description"]
-    for col, h in enumerate(headers, start=1):
+    for col, h in enumerate(["Date", "Category", "Amount (PKR)", "Description"], start=1):
         c = ws.cell(row=3, column=col, value=h)
         c.fill = header_fill
         c.font = header_font
@@ -264,51 +283,41 @@ def build_excel(df, month_label, salary, budget, total_spent):
         ws.cell(row=r, column=4, value=row["description"]).border = border
         r += 1
 
-    # total row
-    tcell = ws.cell(row=r, column=2, value="TOTAL")
-    tcell.font = label_font
-    tsum = ws.cell(row=r, column=3, value=float(total_spent))
-    tsum.number_format = money_fmt
-    tsum.font = label_font
+    ws.cell(row=r, column=2, value="TOTAL").font = label_font
+    ts = ws.cell(row=r, column=3, value=float(total_spent))
+    ts.number_format = money_fmt
+    ts.font = label_font
 
-    widths = [14, 22, 16, 40]
-    for i, w in enumerate(widths, start=1):
+    for i, w in enumerate([14, 22, 16, 40], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A4"
     if r > 4:
         ws.auto_filter.ref = f"A3:D{r-1}"
 
-    # ---- Sheet 2: Summary ----
     ws2 = wb.create_sheet("Summary")
     ws2["A1"] = f"Summary - {month_label}"
     ws2["A1"].font = title_font
     ws2.merge_cells("A1:C1")
 
-    rows_info = [
+    rr = 3
+    for label, val in [
         ("Monthly salary", salary),
         ("Monthly budget", budget),
         ("Total spent", total_spent),
         ("Left from budget", (budget - total_spent) if budget else 0),
         ("Left from salary", (salary - total_spent) if salary else 0),
-    ]
-    rr = 3
-    for label, val in rows_info:
-        lc = ws2.cell(row=rr, column=1, value=label)
-        lc.font = label_font
+    ]:
+        ws2.cell(row=rr, column=1, value=label).font = label_font
         vc = ws2.cell(row=rr, column=2, value=float(val))
         vc.number_format = money_fmt
         rr += 1
 
-    # category breakdown
     rr += 1
-    ws2.cell(row=rr, column=1, value="Category").fill = header_fill
-    ws2.cell(row=rr, column=1).font = header_font
-    ws2.cell(row=rr, column=2, value="Amount (PKR)").fill = header_fill
-    ws2.cell(row=rr, column=2).font = header_font
-    ws2.cell(row=rr, column=3, value="Share").fill = header_fill
-    ws2.cell(row=rr, column=3).font = header_font
+    for col, h in enumerate(["Category", "Amount (PKR)", "Share"], start=1):
+        c = ws2.cell(row=rr, column=col, value=h)
+        c.fill = header_fill
+        c.font = header_font
     rr += 1
-
     if not df.empty:
         by_cat = df.groupby("category")["amount"].sum().reindex(ALL_CATEGORIES).fillna(0)
         by_cat = by_cat[by_cat > 0]
@@ -332,36 +341,10 @@ def build_excel(df, month_label, salary, budget, total_spent):
 # ======================================================================
 # App
 # ======================================================================
-init_db()
 today = date.today()
+settings = load_settings()
 
 st.title("💸 My Expense Tracker")
-
-# ---- Sidebar: setup ----
-with st.sidebar:
-    st.header("⚙️ Setup")
-    st.caption("Set these once. Saved automatically.")
-
-    cur_salary = float(get_setting("monthly_salary", 0) or 0)
-    cur_budget = float(get_setting("monthly_budget", 0) or 0)
-    cur_sal_day = int(get_setting("salary_day", 1) or 1)
-
-    salary_in = st.number_input("Monthly salary (PKR)", min_value=0, value=int(cur_salary),
-                                step=1000, format="%d")
-    budget_in = st.number_input("Monthly budget (PKR)", min_value=0, value=int(cur_budget),
-                                step=1000, format="%d", help="How much you plan to spend per month.")
-    salday_in = st.number_input("Salary date (day of month)", min_value=1, max_value=31,
-                                value=cur_sal_day, step=1, help="Day your salary arrives.")
-
-    if st.button("💾 Save setup", use_container_width=True):
-        set_setting("monthly_salary", salary_in)
-        set_setting("monthly_budget", budget_in)
-        set_setting("salary_day", salday_in)
-        st.success("Saved!")
-        st.rerun()
-
-    st.divider()
-    st.caption("Storage: " + ("Postgres (permanent)" if USE_POSTGRES else "Local SQLite (testing only)"))
 
 # ---- Month selector ----
 ctop1, ctop2, _ = st.columns([1, 1, 3])
@@ -374,18 +357,59 @@ with ctop2:
 month_key = f"{sel_year:04d}-{sel_month:02d}"
 month_label = datetime(sel_year, sel_month, 1).strftime("%B %Y")
 
+normal_day = int(settings.get("salary_day", DEFAULT_SALARY_DAY) or DEFAULT_SALARY_DAY)
+salary = float(settings.get("monthly_salary", 0) or 0)
+budget = float(settings.get("monthly_budget", 0) or 0)
+
+# ---- Sidebar ----
+with st.sidebar:
+    st.header("⚙️ Setup")
+    st.caption("Set these once. Saved automatically.")
+
+    salary_in = st.number_input("Monthly salary (PKR)", min_value=0, value=int(salary),
+                                step=1000, format="%d")
+    budget_in = st.number_input("Monthly budget (PKR)", min_value=0, value=int(budget),
+                                step=1000, format="%d", help="How much you plan to spend per month.")
+    salday_in = st.number_input("Normal salary day", min_value=1, max_value=31, value=normal_day,
+                                step=1, help="Usually 25. If it falls on a weekend the app moves it to the Friday before.")
+    if st.button("💾 Save setup", use_container_width=True):
+        set_setting("monthly_salary", salary_in)
+        set_setting("monthly_budget", budget_in)
+        set_setting("salary_day", salday_in)
+        st.success("Saved!")
+        st.rerun()
+
+    st.divider()
+    st.subheader("📅 Salary date")
+    st.caption(f"For {month_label}. The app guesses it from your normal day. "
+               "If a holiday moved it (like the 23rd this month), set the real date here.")
+    default_pd = payday_for_month(settings, sel_year, sel_month, normal_day)
+    actual_pd = st.date_input("Actual salary date", value=default_pd, key=f"pd_{month_key}")
+    colp1, colp2 = st.columns(2)
+    with colp1:
+        if st.button("Save date", use_container_width=True):
+            set_setting(f"payday_{month_key}", actual_pd.isoformat())
+            st.success("Saved.")
+            st.rerun()
+    with colp2:
+        if st.button("Reset", use_container_width=True, help="Go back to the automatic guess."):
+            set_setting(f"payday_{month_key}", "")
+            st.success("Reset.")
+            st.rerun()
+
+    st.divider()
+    st.caption("Storage: " + ("Postgres (permanent)" if USE_POSTGRES else "Local SQLite (testing only)"))
+
+# ---- Load month data ----
 df = load_expenses(month=month_key)
 total_spent = float(df["amount"].sum()) if not df.empty else 0.0
-salary = float(get_setting("monthly_salary", 0) or 0)
-budget = float(get_setting("monthly_budget", 0) or 0)
-sal_day = int(get_setting("salary_day", 1) or 1)
 
 tab_dash, tab_add, tab_manage, tab_export = st.tabs(
     ["📊 Dashboard", "➕ Add", "🧾 Manage (edit / delete)", "⬇️ Export"]
 )
 
 # ======================================================================
-# TAB: Dashboard
+# Dashboard
 # ======================================================================
 with tab_dash:
     st.subheader(f"Overview for {month_label}")
@@ -397,20 +421,11 @@ with tab_dash:
     m3.metric("Salary", money(salary),
               delta=(money(salary - total_spent) + " left") if salary else None)
 
-    # days to salary
-    try:
-        last_day = monthrange(today.year, today.month)[1]
-        this_payday = date(today.year, today.month, min(sal_day, last_day))
-        if today <= this_payday:
-            days_to = (this_payday - today).days
-        else:
-            nm = today.month + 1 if today.month < 12 else 1
-            ny = today.year if today.month < 12 else today.year + 1
-            nl = monthrange(ny, nm)[1]
-            days_to = (date(ny, nm, min(sal_day, nl)) - today).days
-        m4.metric("Days to salary", f"{days_to} days")
-    except Exception:
-        m4.metric("Days to salary", "-")
+    np_ = next_payday(settings, normal_day, today)
+    days_to = (np_ - today).days
+    m4.metric("Next salary", np_.strftime("%d %b"),
+              delta=f"in {days_to} days" if days_to > 0 else "today",
+              delta_color="off")
 
     if budget > 0:
         pct = min(total_spent / budget, 1.0)
@@ -419,57 +434,46 @@ with tab_dash:
             st.warning(f"Over budget by {money(total_spent - budget)} this month.")
 
     st.divider()
-
     if df.empty:
         st.info("No expenses yet for this month. Add one in the ➕ Add tab.")
     else:
         left, right = st.columns(2)
         with left:
             st.markdown("**Spending by category**")
-            by_cat = (df.groupby("category")["amount"].sum()
-                        .reindex(ALL_CATEGORIES).fillna(0))
-            by_cat = by_cat[by_cat > 0].reset_index()
-            by_cat.columns = ["Category", "Amount"]
-            chart = (
-                alt.Chart(by_cat)
-                .mark_bar(cornerRadiusEnd=4, color="#6C5CE7")
-                .encode(
+            bc = df.groupby("category")["amount"].sum().reindex(ALL_CATEGORIES).fillna(0)
+            bc = bc[bc > 0].reset_index()
+            bc.columns = ["Category", "Amount"]
+            st.altair_chart(
+                alt.Chart(bc).mark_bar(cornerRadiusEnd=4, color="#6C5CE7").encode(
                     x=alt.X("Amount:Q", title="PKR", axis=alt.Axis(format=",.0f")),
                     y=alt.Y("Category:N", sort="-x", title=None),
-                    tooltip=[alt.Tooltip("Category:N"),
-                             alt.Tooltip("Amount:Q", format=",.0f", title="PKR")],
-                )
-                .properties(height=280)
+                    tooltip=[alt.Tooltip("Category:N"), alt.Tooltip("Amount:Q", format=",.0f", title="PKR")],
+                ).properties(height=280),
+                use_container_width=True,
             )
-            st.altair_chart(chart, use_container_width=True)
-
         with right:
             st.markdown("**Daily spending this month**")
-            by_day = (df.groupby("spent_on")["amount"].sum().sort_index().reset_index())
-            by_day.columns = ["Date", "Amount"]
-            line = (
-                alt.Chart(by_day)
-                .mark_line(point=True, color="#00B894")
-                .encode(
+            bd = df.groupby("spent_on")["amount"].sum().sort_index().reset_index()
+            bd.columns = ["Date", "Amount"]
+            st.altair_chart(
+                alt.Chart(bd).mark_line(point=True, color="#00B894").encode(
                     x=alt.X("Date:T", title=None),
                     y=alt.Y("Amount:Q", title="PKR", axis=alt.Axis(format=",.0f")),
-                    tooltip=[alt.Tooltip("Date:T"),
-                             alt.Tooltip("Amount:Q", format=",.0f", title="PKR")],
-                )
-                .properties(height=280)
+                    tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Amount:Q", format=",.0f", title="PKR")],
+                ).properties(height=280),
+                use_container_width=True,
             )
-            st.altair_chart(line, use_container_width=True)
 
         st.markdown("**Category breakdown**")
-        bd = df.groupby("category")["amount"].sum().reindex(ALL_CATEGORIES).fillna(0)
-        bd = bd[bd > 0].reset_index()
-        bd.columns = ["Category", "Amount"]
-        bd["Share"] = (bd["Amount"] / total_spent * 100).round(1).astype(str) + "%"
-        bd["Amount"] = bd["Amount"].apply(money)
-        st.dataframe(bd, use_container_width=True, hide_index=True)
+        bd2 = df.groupby("category")["amount"].sum().reindex(ALL_CATEGORIES).fillna(0)
+        bd2 = bd2[bd2 > 0].reset_index()
+        bd2.columns = ["Category", "Amount"]
+        bd2["Share"] = (bd2["Amount"] / total_spent * 100).round(1).astype(str) + "%"
+        bd2["Amount"] = bd2["Amount"].apply(money)
+        st.dataframe(bd2, use_container_width=True, hide_index=True)
 
 # ======================================================================
-# TAB: Add
+# Add
 # ======================================================================
 with tab_add:
     st.subheader("Add an expense")
@@ -483,8 +487,7 @@ with tab_add:
             when = st.date_input("Date", value=today)
         desc = st.text_input("Description (optional, useful for Miscellaneous)",
                              placeholder="e.g. Haircut, medicine, gift")
-        ok = st.form_submit_button("Add expense", use_container_width=True, type="primary")
-        if ok:
+        if st.form_submit_button("Add expense", use_container_width=True, type="primary"):
             if amt <= 0:
                 st.error("Amount must be greater than 0.")
             else:
@@ -493,23 +496,17 @@ with tab_add:
                 st.rerun()
 
 # ======================================================================
-# TAB: Manage (edit / delete)  -> full CRUD
+# Manage (full CRUD)
 # ======================================================================
 with tab_manage:
     st.subheader(f"Manage expenses - {month_label}")
     if df.empty:
         st.info("Nothing to manage for this month yet.")
     else:
-        st.caption("Edit any cell directly. Use the trash icon on the left of a row to delete it. "
-                   "Then press Save changes.")
-
+        st.caption("Edit any cell directly. Use the trash icon to delete a row. Then press Save changes.")
         editable = df[["id", "spent_on", "category", "amount", "description"]].copy()
-
         edited = st.data_editor(
-            editable,
-            use_container_width=True,
-            hide_index=True,
-            num_rows="dynamic",
+            editable, use_container_width=True, hide_index=True, num_rows="dynamic",
             column_config={
                 "id": None,
                 "spent_on": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
@@ -519,12 +516,10 @@ with tab_manage:
             },
             key="editor",
         )
-
         if st.button("💾 Save changes", type="primary"):
             orig_by_id = {int(r["id"]): r for _, r in df.iterrows()}
-            seen_ids = set()
+            seen = set()
             changed = added = removed = 0
-
             for _, row in edited.iterrows():
                 rid = row.get("id")
                 has_id = pd.notna(rid)
@@ -532,59 +527,50 @@ with tab_manage:
                 category = row.get("category")
                 spent = row.get("spent_on")
                 description = row.get("description") or ""
-
-                # skip blank new rows
                 if not has_id and (pd.isna(amount) or not category or not spent):
                     continue
-
                 if has_id:
                     rid = int(rid)
-                    seen_ids.add(rid)
+                    seen.add(rid)
                     o = orig_by_id.get(rid)
-                    if o is not None:
-                        if (str(o["spent_on"]) != str(spent) or o["category"] != category
-                                or float(o["amount"]) != float(amount or 0)
-                                or (o["description"] or "") != description):
-                            update_expense(rid, category, amount or 0, description, spent)
-                            changed += 1
+                    if o is not None and (
+                        str(o["spent_on"]) != str(spent) or o["category"] != category
+                        or float(o["amount"]) != float(amount or 0)
+                        or (o["description"] or "") != description
+                    ):
+                        update_expense(rid, category, amount or 0, description, spent)
+                        changed += 1
                 else:
                     if amount and float(amount) > 0:
                         create_expense(category, amount, description, spent)
                         added += 1
-
-            # anything in original not seen = deleted in the grid
             for rid in orig_by_id:
-                if rid not in seen_ids:
+                if rid not in seen:
                     delete_expense(rid)
                     removed += 1
-
             st.success(f"Saved. {changed} edited, {added} added, {removed} deleted.")
             st.rerun()
 
 # ======================================================================
-# TAB: Export
+# Export
 # ======================================================================
 with tab_export:
     st.subheader("Download your data")
     if df.empty:
         st.info("No data for this month to export yet.")
     else:
-        excel_bytes = build_excel(df, month_label, salary, budget, total_spent)
         st.download_button(
             "⬇️ Download Excel (formatted)",
-            data=excel_bytes,
+            data=build_excel(df, month_label, salary, budget, total_spent),
             file_name=f"expenses_{month_key}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True,
+            type="primary", use_container_width=True,
         )
-        csv = df[["spent_on", "category", "amount", "description"]].to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇️ Download CSV (plain)",
-            data=csv,
+            data=df[["spent_on", "category", "amount", "description"]].to_csv(index=False).encode("utf-8"),
             file_name=f"expenses_{month_key}.csv",
-            mime="text/csv",
-            use_container_width=True,
+            mime="text/csv", use_container_width=True,
         )
-        st.caption("The Excel file has two sheets: a formatted Expenses list with a total, "
+        st.caption("Excel has two sheets: a formatted Expenses list with a total, "
                    "and a Summary with salary, budget, and category breakdown.")
