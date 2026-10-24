@@ -1,0 +1,7 @@
+# never commit your real secrets or local database
+.streamlit/secrets.toml
+expenses.db
+__pycache__/
+*.pyc
+.venv/
+venv/
