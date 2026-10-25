@@ -1,21 +1,20 @@
 """
 Personal Expense Tracker (Streamlit)
 =====================================
-Single-user expense tracker with charts, full CRUD, a formatted Excel
-export, smart salary dates, and a pay-cycle view. Currency: PKR.
+Single-user expense tracker with charts, full CRUD, custom categories,
+a formatted Excel export, smart salary dates, and a pay-cycle view.
+Currency: PKR.
 
-Two ways to group a "month":
-  - Pay cycle (default): from one salary date to the day before the next.
-    The salary received at the end of October funds the "November" cycle
+"Month" grouping:
+  - Pay cycle (default): salary date to the day before the next salary.
+    The salary received end of October funds the "November" cycle
     (e.g. 23 Oct to 24 Nov).
   - Calendar month: plain 1st to end of month.
 
 Storage (automatic):
   - Postgres if a connection string is provided (permanent)
   - else local SQLite file (testing)
-
-Connection string read from: st.secrets["DATABASE_URL"], then env
-DATABASE_URL, else local SQLite.
+Read from st.secrets["DATABASE_URL"], then env DATABASE_URL, else SQLite.
 
 Run locally:
     pip install -r requirements.txt
@@ -32,21 +31,21 @@ import altair as alt
 import streamlit as st
 
 # ----------------------------------------------------------------------
-# Categories & groups
+# Built-in categories & groups
 # ----------------------------------------------------------------------
-COMMUTE_CATEGORIES = ["InDrive to office", "InDrive back home"]
-FOOD_CATEGORIES = ["Breakfast", "Lunch", "Dinner"]
-DAILY_CATEGORIES = COMMUTE_CATEGORIES + FOOD_CATEGORIES
-MONTHLY_CATEGORIES = ["Rent", "Internet bill", "Mobile package"]
-MISC_CATEGORY = "Miscellaneous"
-ALL_CATEGORIES = DAILY_CATEGORIES + MONTHLY_CATEGORIES + [MISC_CATEGORY]
-
-GROUPS = {
+BUILTIN_CATEGORIES = [
+    "InDrive to office", "InDrive back home",
+    "Breakfast", "Lunch", "Dinner",
+    "Rent", "Internet bill", "Mobile package",
+    "Miscellaneous",
+]
+BUILTIN_GROUPS = {
     "InDrive to office": "Commute", "InDrive back home": "Commute",
     "Breakfast": "Food", "Lunch": "Food", "Dinner": "Food",
     "Rent": "Fixed monthly", "Internet bill": "Fixed monthly", "Mobile package": "Fixed monthly",
     "Miscellaneous": "Other",
 }
+GROUP_OPTIONS = ["Commute", "Food", "Fixed monthly", "Entertainment", "Shopping", "Health", "Other"]
 
 CURRENCY = "PKR"
 DEFAULT_SALARY_DAY = 25
@@ -57,7 +56,7 @@ st.markdown(
     """
     <style>
       .block-container { padding-top: 2rem; }
-      div[data-testid="stMetricValue"] { font-size: 1.6rem; }
+      div[data-testid="stMetricValue"] { font-size: 1.5rem; }
       div[data-testid="stMetric"] {
           background: rgba(108, 92, 231, 0.08);
           border: 1px solid rgba(108, 92, 231, 0.20);
@@ -144,6 +143,7 @@ def init_db():
                 description TEXT DEFAULT '', spent_on TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
     run("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    run("CREATE TABLE IF NOT EXISTS categories (name TEXT PRIMARY KEY, grp TEXT)")
 
 
 if "db_ready" not in st.session_state:
@@ -162,6 +162,24 @@ def set_setting(key, value):
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, str(value)))
     else:
         run("INSERT OR REPLACE INTO settings (key, value) VALUES (%s, %s)", (key, str(value)))
+
+
+# ----- custom categories -----
+def load_custom_categories():
+    rows = run("SELECT name, grp FROM categories ORDER BY name", fetch=True) or []
+    return [(r[0], r[1]) for r in rows]
+
+
+def add_category(name, grp):
+    if USE_POSTGRES:
+        run("INSERT INTO categories (name, grp) VALUES (%s, %s) "
+            "ON CONFLICT (name) DO UPDATE SET grp = EXCLUDED.grp", (name, grp))
+    else:
+        run("INSERT OR REPLACE INTO categories (name, grp) VALUES (%s, %s)", (name, grp))
+
+
+def delete_category(name):
+    run("DELETE FROM categories WHERE name = %s", (name,))
 
 
 # ----- CRUD -----
@@ -210,7 +228,6 @@ def next_month(y, m):
 
 
 def estimated_payday(year, month, normal_day):
-    """normal_day of the month, moved back to Friday if it lands on a weekend."""
     last = monthrange(year, month)[1]
     d = date(year, month, min(normal_day, last))
     wd = d.weekday()
@@ -243,8 +260,6 @@ def next_payday(settings, normal_day, from_date):
 
 
 def cycle_bounds(settings, normal_day, label_year, label_month):
-    """A cycle labelled (Y, M) runs from the previous month's payday to the day
-    before this month's payday. e.g. the 'November' cycle = Oct payday .. Nov payday-1."""
     py, pm = prev_month(label_year, label_month)
     start = payday_for_month(settings, py, pm, normal_day)
     end = payday_for_month(settings, label_year, label_month, normal_day) - timedelta(days=1)
@@ -252,7 +267,6 @@ def cycle_bounds(settings, normal_day, label_year, label_month):
 
 
 def current_cycle_label(settings, normal_day, today):
-    """Which cycle is 'today' in? If this month's salary has arrived, we are in next month's cycle."""
     pay_this = payday_for_month(settings, today.year, today.month, normal_day)
     if today >= pay_this:
         return next_month(today.year, today.month)
@@ -262,7 +276,7 @@ def current_cycle_label(settings, normal_day, today):
 # ----------------------------------------------------------------------
 # Excel export
 # ----------------------------------------------------------------------
-def build_excel(df, label, salary, budget, total_spent):
+def build_excel(df, label, salary, budget, total_spent, all_categories):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -319,7 +333,7 @@ def build_excel(df, label, salary, budget, total_spent):
 
     rr = 3
     for lbl, val in [
-        ("Monthly salary", salary), ("Monthly budget", budget), ("Total spent", total_spent),
+        ("Salary", salary), ("Budget", budget), ("Total spent", total_spent),
         ("Left from budget", (budget - total_spent) if budget else 0),
         ("Left from salary", (salary - total_spent) if salary else 0),
     ]:
@@ -335,8 +349,7 @@ def build_excel(df, label, salary, budget, total_spent):
         c.font = header_font
     rr += 1
     if not df.empty:
-        by_cat = df.groupby("category")["amount"].sum().reindex(ALL_CATEGORIES).fillna(0)
-        by_cat = by_cat[by_cat > 0]
+        by_cat = df.groupby("category")["amount"].sum().sort_values(ascending=False)
         for cat, amt in by_cat.items():
             ws2.cell(row=rr, column=1, value=cat)
             ac = ws2.cell(row=rr, column=2, value=float(amt))
@@ -359,6 +372,13 @@ def build_excel(df, label, salary, budget, total_spent):
 # ======================================================================
 today = date.today()
 settings = load_settings()
+custom_cats = load_custom_categories()
+
+# dynamic category list + group map (built-in + custom)
+ALL_CATEGORIES = BUILTIN_CATEGORIES + [n for n, _ in custom_cats if n not in BUILTIN_CATEGORIES]
+GROUPS = dict(BUILTIN_GROUPS)
+for n, g in custom_cats:
+    GROUPS[n] = g or "Other"
 
 normal_day = int(settings.get("salary_day", DEFAULT_SALARY_DAY) or DEFAULT_SALARY_DAY)
 salary = float(settings.get("monthly_salary", 0) or 0)
@@ -395,12 +415,11 @@ label = datetime(sel_year, sel_month, 1).strftime("%B %Y")
 if use_cycle:
     period_start, period_end = cycle_bounds(settings, normal_day, sel_year, sel_month)
     period_key = f"cycle_{sel_year:04d}-{sel_month:02d}"
-    range_text = f"{period_start.strftime('%d %b')} to {period_end.strftime('%d %b %Y')}"
 else:
     last = monthrange(sel_year, sel_month)[1]
     period_start, period_end = date(sel_year, sel_month, 1), date(sel_year, sel_month, last)
     period_key = f"{sel_year:04d}-{sel_month:02d}"
-    range_text = f"{period_start.strftime('%d %b')} to {period_end.strftime('%d %b %Y')}"
+range_text = f"{period_start.strftime('%d %b')} to {period_end.strftime('%d %b %Y')}"
 
 # ---- Sidebar ----
 with st.sidebar:
@@ -423,7 +442,7 @@ with st.sidebar:
     st.subheader("📅 Salary date")
     if use_cycle:
         st.caption(f"Date the salary for the {label} cycle arrived (starts this cycle). "
-                   "The app guesses it; set the real date if a holiday moved it.")
+                   "Set the real date if a holiday moved it.")
         py, pm = prev_month(sel_year, sel_month)
         default_pd = payday_for_month(settings, py, pm, normal_day)
         pd_key_target = f"payday_{py:04d}-{pm:02d}"
@@ -451,9 +470,11 @@ with st.sidebar:
 # ---- Load period data ----
 df = load_expenses_range(period_start, period_end)
 total_spent = float(df["amount"].sum()) if not df.empty else 0.0
+budget_left = budget - total_spent
+salary_left = salary - total_spent
 
-tab_dash, tab_add, tab_manage, tab_export = st.tabs(
-    ["📊 Dashboard", "➕ Add", "🧾 Manage (edit / delete)", "⬇️ Export"]
+tab_dash, tab_add, tab_notes, tab_manage, tab_cats, tab_export = st.tabs(
+    ["📊 Dashboard", "➕ Add", "📝 Notes", "🧾 Manage", "🏷️ Categories", "⬇️ Export"]
 )
 
 # ======================================================================
@@ -464,37 +485,54 @@ with tab_dash:
     st.subheader(f"Overview for {label} {title_word}")
     st.caption(f"Covers {range_text}")
 
+    # ---- clear money tiles: spent, budget left, salary left, next salary ----
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total spent", money(total_spent))
-    m2.metric("Budget", money(budget),
-              delta=(money(budget - total_spent) + " left") if budget else None)
-    m3.metric("Salary", money(salary),
-              delta=(money(salary - total_spent) + " left") if salary else None)
+    m1.metric("Spent", money(total_spent))
+
+    if budget > 0:
+        m2.metric("Budget left", money(budget_left),
+                  delta=f"of {money(budget)}", delta_color="off")
+    else:
+        m2.metric("Budget left", "set budget", help="Set a budget in the sidebar.")
+
+    if salary > 0:
+        m3.metric("Salary left", money(salary_left),
+                  delta=f"of {money(salary)}", delta_color="off")
+    else:
+        m3.metric("Salary left", "set salary", help="Set your salary in the sidebar.")
+
     np_ = next_payday(settings, normal_day, today)
     days_to = (np_ - today).days
     m4.metric("Next salary", np_.strftime("%d %b"),
               delta=(f"in {days_to} days" if days_to > 0 else "today"), delta_color="off")
 
+    # ---- budget bar + safe-to-spend ----
     if budget > 0:
         pct = min(total_spent / budget, 1.0)
         st.progress(pct, text=f"Budget used: {money(total_spent)} / {money(budget)} ({pct*100:.0f}%)")
         if total_spent > budget:
-            st.warning(f"Over budget by {money(total_spent - budget)} this {title_word}.")
+            st.error(f"Over budget by {money(total_spent - budget)} this {title_word}.")
+        else:
+            st.success(f"You have {money(budget_left)} left to spend this {title_word}.")
+            # safe-to-spend per day, only meaningful for the cycle you are currently in
+            if period_start <= today <= period_end:
+                days_left = (period_end - today).days + 1
+                if days_left > 0:
+                    st.caption(f"That is about {money(budget_left / days_left)} per day "
+                               f"for the {days_left} days left until your next salary.")
 
     st.divider()
     if df.empty:
         st.info(f"No expenses yet for this {title_word}. Add one in the ➕ Add tab.")
     else:
-        bc = df.groupby("category")["amount"].sum().reindex(ALL_CATEGORIES).fillna(0)
-        bc = bc[bc > 0].reset_index()
+        bc = df.groupby("category")["amount"].sum().sort_values(ascending=False).reset_index()
         bc.columns = ["Category", "Amount"]
 
         grp = df.copy()
-        grp["Group"] = grp["category"].map(GROUPS).fillna("Other")
+        grp["Group"] = grp["category"].map(lambda c: GROUPS.get(c, "Other"))
         gg = grp.groupby("Group")["amount"].sum().reset_index()
         gg.columns = ["Group", "Amount"]
 
-        # Row 1: bar + daily line
         r1c1, r1c2 = st.columns(2)
         with r1c1:
             st.markdown("**Spending by category**")
@@ -503,7 +541,7 @@ with tab_dash:
                     x=alt.X("Amount:Q", title="PKR", axis=alt.Axis(format=",.0f")),
                     y=alt.Y("Category:N", sort="-x", title=None),
                     tooltip=[alt.Tooltip("Category:N"), alt.Tooltip("Amount:Q", format=",.0f", title="PKR")],
-                ).properties(height=280),
+                ).properties(height=300),
                 use_container_width=True,
             )
         with r1c2:
@@ -515,21 +553,20 @@ with tab_dash:
                     x=alt.X("Date:T", title=None),
                     y=alt.Y("Amount:Q", title="PKR", axis=alt.Axis(format=",.0f")),
                     tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Amount:Q", format=",.0f", title="PKR")],
-                ).properties(height=280),
+                ).properties(height=300),
                 use_container_width=True,
             )
 
-        # Row 2: pie (by category) + donut (by group)
         r2c1, r2c2 = st.columns(2)
         with r2c1:
             st.markdown("**Category share (pie)**")
             st.altair_chart(
                 alt.Chart(bc).mark_arc().encode(
                     theta=alt.Theta("Amount:Q", stack=True),
-                    color=alt.Color("Category:N", scale=alt.Scale(scheme="tableau10"),
+                    color=alt.Color("Category:N", scale=alt.Scale(scheme="tableau20"),
                                     legend=alt.Legend(title=None, orient="bottom", columns=2)),
                     tooltip=[alt.Tooltip("Category:N"), alt.Tooltip("Amount:Q", format=",.0f", title="PKR")],
-                ).properties(height=300),
+                ).properties(height=320),
                 use_container_width=True,
             )
         with r2c2:
@@ -540,15 +577,15 @@ with tab_dash:
                     color=alt.Color("Group:N", scale=alt.Scale(scheme="set2"),
                                     legend=alt.Legend(title=None, orient="bottom")),
                     tooltip=[alt.Tooltip("Group:N"), alt.Tooltip("Amount:Q", format=",.0f", title="PKR")],
-                ).properties(height=300),
+                ).properties(height=320),
                 use_container_width=True,
             )
 
         st.markdown("**Category breakdown**")
-        bd2 = bc.copy()
-        bd2["Share"] = (bd2["Amount"] / total_spent * 100).round(1).astype(str) + "%"
-        bd2["Amount"] = bd2["Amount"].apply(money)
-        st.dataframe(bd2, use_container_width=True, hide_index=True)
+        tbl = bc.copy()
+        tbl["Share"] = (tbl["Amount"] / total_spent * 100).round(1).astype(str) + "%"
+        tbl["Amount"] = tbl["Amount"].apply(money)
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
 
 # ======================================================================
 # Add
@@ -563,8 +600,8 @@ with tab_add:
             amt = st.number_input("Amount (PKR)", min_value=0, step=50, format="%d")
         with c3:
             when = st.date_input("Date", value=today)
-        desc = st.text_input("Description (optional, useful for Miscellaneous)",
-                             placeholder="e.g. Haircut, medicine, gift")
+        desc = st.text_input("Description (optional)",
+                             placeholder="e.g. Movie with friends, medicine, gift")
         if st.form_submit_button("Add expense", use_container_width=True, type="primary"):
             if amt <= 0:
                 st.error("Amount must be greater than 0.")
@@ -572,6 +609,34 @@ with tab_add:
                 create_expense(cat, amt, desc, when)
                 st.success(f"Added {money(amt)} for {cat}.")
                 st.rerun()
+    st.caption("Need a category that is not listed? Add it in the 🏷️ Categories tab.")
+
+# ======================================================================
+# Notes (view descriptions)
+# ======================================================================
+with tab_notes:
+    st.subheader(f"Notes & descriptions - {label}")
+    if df.empty:
+        st.info("No expenses this period yet.")
+    else:
+        with_notes = df[df["description"].str.strip() != ""].copy()
+        cats_present = ["All categories"] + sorted(df["category"].unique().tolist())
+        pick = st.selectbox("Filter by category", cats_present)
+        view = with_notes if pick == "All categories" else with_notes[with_notes["category"] == pick]
+
+        if view.empty:
+            st.info("No descriptions written for this selection. "
+                    "Add a description when you log an expense and it will show here.")
+        else:
+            show = view[["spent_on", "category", "amount", "description"]].copy()
+            show = show.sort_values("spent_on", ascending=False)
+            show["amount"] = show["amount"].apply(money)
+            show.columns = ["Date", "Category", "Amount", "Description"]
+            st.dataframe(
+                show, use_container_width=True, hide_index=True,
+                column_config={"Description": st.column_config.TextColumn(width="large")},
+            )
+            st.caption(f"{len(view)} expense(s) with a description.")
 
 # ======================================================================
 # Manage (full CRUD)
@@ -590,7 +655,7 @@ with tab_manage:
                 "spent_on": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
                 "category": st.column_config.SelectboxColumn("Category", options=ALL_CATEGORIES, required=True),
                 "amount": st.column_config.NumberColumn("Amount (PKR)", min_value=0, step=50, format="%d"),
-                "description": st.column_config.TextColumn("Description"),
+                "description": st.column_config.TextColumn("Description", width="large"),
             },
             key="editor",
         )
@@ -630,6 +695,53 @@ with tab_manage:
             st.rerun()
 
 # ======================================================================
+# Categories (custom)
+# ======================================================================
+with tab_cats:
+    st.subheader("Your categories")
+    st.caption("Built-in categories are always available. Add your own below, "
+               "each in a group so it shows correctly in the donut chart.")
+
+    st.markdown("**Add a new category**")
+    with st.form("add_cat_form", clear_on_submit=True):
+        cc1, cc2 = st.columns([2, 1])
+        with cc1:
+            new_name = st.text_input("Category name", placeholder="e.g. Movie nights, InDrive (other), Gym")
+        with cc2:
+            new_grp = st.selectbox("Group", GROUP_OPTIONS, index=GROUP_OPTIONS.index("Entertainment"))
+        if st.form_submit_button("Add category", type="primary"):
+            name = (new_name or "").strip()
+            if not name:
+                st.error("Please type a category name.")
+            elif name in ALL_CATEGORIES:
+                st.error("That category already exists.")
+            else:
+                add_category(name, new_grp)
+                st.success(f"Added '{name}' in group {new_grp}.")
+                st.rerun()
+
+    st.divider()
+    st.markdown("**Built-in categories**")
+    builtin_df = pd.DataFrame(
+        [(c, BUILTIN_GROUPS[c]) for c in BUILTIN_CATEGORIES], columns=["Category", "Group"]
+    )
+    st.dataframe(builtin_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**Your custom categories**")
+    if not custom_cats:
+        st.info("None yet. Add one above.")
+    else:
+        for name, grp in custom_cats:
+            coln, colg, cold = st.columns([3, 2, 1])
+            coln.write(name)
+            colg.write(grp or "Other")
+            if cold.button("Delete", key=f"delcat_{name}"):
+                delete_category(name)
+                st.success(f"Deleted '{name}'. Existing expenses keep their category.")
+                st.rerun()
+        st.caption("Deleting a category does not delete past expenses logged under it.")
+
+# ======================================================================
 # Export
 # ======================================================================
 with tab_export:
@@ -639,7 +751,7 @@ with tab_export:
     else:
         st.download_button(
             "⬇️ Download Excel (formatted)",
-            data=build_excel(df, label, salary, budget, total_spent),
+            data=build_excel(df, label, salary, budget, total_spent, ALL_CATEGORIES),
             file_name=f"expenses_{period_key}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary", use_container_width=True,
